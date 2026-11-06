@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      # 单元测试和构建不需要浏览器；E2E 依赖真实站点与录屏，在本地运行
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run test:unit
+      - run: npm run build
+      - name: Check build outputs
+        run: |
+          test -s extension/agent-reveal.js
+          test -s extension/offscreen.js
+          test -s dist/bookmarklet.txt
+          node -e "JSON.parse(require('fs').readFileSync('extension/manifest.json','utf8'))"

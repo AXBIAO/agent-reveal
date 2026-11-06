@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Agent Reveal",
+  "version": "0.3.0",
+  "description": "多 agent 光标拉框搭建当前网页的演示动画，自动录屏并保存。",
+  "action": {
+    "default_title": "Agent Reveal",
+    "default_popup": "popup.html",
+    "default_icon": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png", "128": "icons/128.png" }
+  },
+  "icons": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png", "128": "icons/128.png" },
+  "background": { "service_worker": "sw.js", "type": "module" },
+  "permissions": ["activeTab", "scripting", "tabCapture", "offscreen", "downloads", "downloads.open", "storage"],
+  "commands": {
+    "start-reveal": {
+      "suggested_key": { "default": "Alt+Shift+R" },
+      "description": "按上次的设置开始播放"
+    }
+  }
+}
