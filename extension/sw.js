@@ -2,6 +2,7 @@
 import { loadSettings, sanitize } from './settings.js';
 import { injectConfig, pageToast, showSavedPanel } from './page-ui.js';
 import { recordingFileName } from './naming.js';
+import { enterMobileView, restoreView, captureSize, restoreErrors } from './viewport.js';
 
 // 会话状态放 storage.session：动画期间 SW 可能被回收，内存变量会丢
 const sessionKey = (tabId) => `session:${tabId}`;
@@ -21,15 +22,20 @@ async function ensureOffscreen() {
   if (ctx.length) return;
   await chrome.offscreen.createDocument({
     url: 'offscreen.html',
-    reasons: ['USER_MEDIA'],
-    justification: '录制当前标签页的演示动画',
+    reasons: ['USER_MEDIA', 'AUDIO_PLAYBACK'],
+    justification: '录制当前标签页的演示动画，并播放光标音效',
   });
 }
 
-async function startRecordingTab(tabId) {
+async function startRecordingTab(tabId, withSound) {
   const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
+  // 按标签页实际像素尺寸固定采集分辨率；只给上限时 Chrome 会放大并加黑边塞进上限尺寸
+  const [{ result: px }] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => ({ w: Math.round(innerWidth * devicePixelRatio), h: Math.round(innerHeight * devicePixelRatio) }),
+  });
   await ensureOffscreen();
-  const r = await toOffscreen('rec-start', { streamId });
+  const r = await toOffscreen('rec-start', { streamId, size: captureSize(px.w, px.h), withSound });
   if (!r || !r.ok) throw new Error((r && r.error) || '录屏启动失败');
 }
 
@@ -39,18 +45,34 @@ async function startOnTab(tabId, rawSettings) {
   if (!/^https?:|^file:/.test(tab.url || '')) throw new Error('这个页面不能运行（浏览器内置页面受限制）');
   if (await getSession(tabId)) throw new Error('这个标签页已经在播放了');
 
+  // 先切视图再开录，录出来的画面就是对应尺寸（手机视图为竖屏）
+  let view = null;
+  if (settings.view === 'mobile') {
+    try {
+      view = await enterMobileView(tabId);
+    } catch (err) {
+      throw new Error(`切换手机视图失败：${err.message}`);
+    }
+  }
+
+  // 音效在离屏文档里合成（扩展页面不受网页自动播放限制）
+  if (settings.sound) {
+    await ensureOffscreen();
+    await toOffscreen('sfx', { name: 'setOn', args: [true] });
+  }
+
   let recording = false;
   if (settings.record) {
     try {
-      await startRecordingTab(tabId);
+      await startRecordingTab(tabId, settings.sound);
       recording = true;
     } catch (err) {
       console.warn('[agent-reveal] 录屏未启动', err);
       await runInTab(tabId, pageToast, `录屏未启动：${err.message}，本次只播放`);
     }
   }
-  await setSession(tabId, { recording, host: new URL(tab.url).hostname || 'page' });
-  const { record, ...cfg } = settings;
+  await setSession(tabId, { recording, view, host: new URL(tab.url).hostname || 'page' });
+  const { record, view: _view, ...cfg } = settings;
   await runInTab(tabId, injectConfig, cfg);
   await chrome.scripting.executeScript({ target: { tabId }, files: ['agent-reveal.js'] });
   return {};
@@ -89,8 +111,13 @@ async function saveRecording(tabId, host, rec) {
 async function onRevealDone(tabId) {
   const s = await getSession(tabId);
   await clearSession(tabId);
-  if (!s || !s.recording) return {};
+  if (!s) return {};
+  if (!s.recording) {
+    await restoreView(s.view);
+    return {};
+  }
   const rec = await toOffscreen('rec-stop');
+  await restoreView(s.view);
   if (!rec || !rec.ok) throw new Error((rec && rec.error) || '停止录屏失败');
   saveRecording(tabId, s.host, rec);
   return {};
@@ -100,6 +127,7 @@ async function onRevealAbort(tabId) {
   const s = await getSession(tabId);
   await clearSession(tabId);
   if (s && s.recording) await toOffscreen('rec-discard');
+  if (s) await restoreView(s.view);
   return {};
 }
 
@@ -141,4 +169,4 @@ chrome.tabs.onUpdated.addListener(async (tabId, info) => {
 });
 
 // 测试入口：Playwright 无法点工具栏按钮，通过 SW 上下文直接调用
-globalThis.__agentRevealTest = { startOnTab };
+globalThis.__agentRevealTest = { startOnTab, restoreErrors };

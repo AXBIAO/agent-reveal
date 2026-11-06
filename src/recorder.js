@@ -5,7 +5,8 @@ export const canRecord = () => !!(navigator.mediaDevices
   && navigator.mediaDevices.getDisplayMedia && (window.VideoEncoder || window.MediaRecorder));
 
 // 需要用户激活（点书签/点按钮）；没有激活时浏览器抛 InvalidStateError
-export async function startRecording() {
+/** @param {MediaStreamTrack|null} audioTrack 音效音轨（可选） */
+export async function startRecording(audioTrack = null) {
   const stream = await navigator.mediaDevices.getDisplayMedia({
     video: { frameRate: { ideal: 60 }, width: { ideal: 3840 }, height: { ideal: 2160 }, displaySurface: 'browser' },
     audio: false,
@@ -13,7 +14,9 @@ export async function startRecording() {
     selfBrowserSurface: 'include',
     surfaceSwitching: 'exclude',
   });
-  return createRecorder(stream);
+  // 音效来自本页合成器（不录网页其它声音），直接并入录屏流
+  const tracks = [...stream.getVideoTracks(), ...(audioTrack ? [audioTrack] : [])];
+  return createRecorder(new MediaStream(tracks));
 }
 
 export const stopRecording = (r) => r.stop();

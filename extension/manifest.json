@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Agent Reveal",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "description": "多 agent 光标拉框搭建当前网页的演示动画，自动录屏并保存。",
   "action": {
     "default_title": "Agent Reveal",

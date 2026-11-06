@@ -30,6 +30,28 @@ function dtsProblems(file) {
   return dts.length ? bad : -1;
 }
 
+
+// 录屏音轨：编码格式与峰值音量（dB）。没有音轨返回 null
+function audioInfo(file) {
+  const probe = spawnSync('ffprobe', ['-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=codec_name', '-of', 'csv=p=0', file]);
+  const codec = String(probe.stdout).trim();
+  if (!codec) return null;
+  const vd = spawnSync('ffmpeg', ['-v', 'info', '-i', file, '-vn', '-af', 'volumedetect', '-f', 'null', '-']);
+  const m = /max_volume:\s*(-?[\d.]+) dB/.exec(String(vd.stderr));
+  const dur = (sel) => parseFloat(String(spawnSync('ffprobe', ['-v', 'error', '-select_streams', sel, '-show_entries', 'stream=duration', '-of', 'csv=p=0', file]).stdout)) || 0;
+  return { codec, maxDb: m ? Number(m[1]) : -Infinity, gap: Math.abs(dur('v') - dur('a')) };
+}
+
+// 设计辅助层的可见元素数：标尺画布、参考线、红线（按颜色识别）
+const designCounts = () => {
+  const o = document.querySelector('[data-agent-reveal]');
+  if (!o) return null;
+  const divs = [...o.querySelectorAll('div')];
+  const has = (rgb) => divs.filter((d) => (d.style.background || d.style.backgroundColor || '').includes(rgb)).length;
+  // 标尺平时收在屏幕外（transform 非 none），拉参考线时滑入
+  const shown = [...o.querySelectorAll('canvas')].filter((cv) => cv.style.transform === 'none').length;
+  return { rulers: shown, guides: has('242, 56, 124'), redlines: has('242, 59, 59') };
+};
 const results = [];
 const check = (name, ok, detail = '') => {
   results.push({ name, ok });
@@ -89,7 +111,7 @@ async function testFullRun(browser, code) {
 
   // 每 0.5s 采样：闲置光标必须隐藏；要观察到拖拽拉框状态
   const shots = new Set([8, 24, 48]);
-  const stats = { idleVisible: 0, dragSeen: 0, maxBusy: 0, samples: 0, typos: 0 };
+  const stats = { idleVisible: 0, dragSeen: 0, maxBusy: 0, samples: 0, typos: 0, rulers: 0, rulersShown: 0, guides: 0, redlines: 0, dupTasks: 0, dupSeen: 0, penSeen: 0 };
   for (let i = 1; i <= 48; i += 1) {
     await page.waitForTimeout(500);
     const s = await page.evaluate(() => {
@@ -100,6 +122,9 @@ async function testFullRun(browser, code) {
         drag: st.agents.filter((a) => a.mode === 'drag').length,
         busy: st.agents.filter((a) => a.busy).length,
         typos: st.typos,
+        dupTasks: (st.dupTasks || []).length,
+        dup: st.agents.some((a) => a.badge && a.badge.style.opacity === '1'),
+        pen: st.agents.some((a) => a.tool === 'pen'),
       };
     });
     if (!s) break;
@@ -108,11 +133,28 @@ async function testFullRun(browser, code) {
     stats.dragSeen += s.drag;
     stats.maxBusy = Math.max(stats.maxBusy, s.busy);
     stats.typos = Math.max(stats.typos, s.typos);
+    stats.dupTasks = Math.max(stats.dupTasks, s.dupTasks);
+    if (s.dup) stats.dupSeen += 1;
+    if (s.pen) stats.penSeen += 1;
+    const dc = await page.evaluate(designCounts);
+    if (dc) {
+      stats.rulers = Math.max(stats.rulers, dc.rulers);
+      if (dc.rulers === 2) stats.rulersShown += 1;
+      stats.guides = Math.max(stats.guides, dc.guides);
+      stats.redlines = Math.max(stats.redlines, dc.redlines);
+    }
     if (shots.has(i)) await page.screenshot({ path: path.join(outDir, `run-${String(i / 2).padStart(2, '0')}s.png`) });
   }
   check('闲置光标全部隐藏', stats.idleVisible === 0, `max idle visible ${stats.idleVisible} / ${stats.samples} samples`);
   check('观察到拖拽拉框', stats.dragSeen > 0, `drag samples ${stats.dragSeen}, max busy ${stats.maxBusy}`);
   check('出现打错再改的打字', stats.typos > 0, `typos ${stats.typos}`);
+  check('标尺在拉参考线时滑入（顶部 + 左侧）', stats.rulers === 2, `最多同时 ${stats.rulers} 条`);
+  check('标尺大部分时间收起，不遮挡网页内容', stats.rulersShown / Math.max(1, stats.samples) < 0.5, `显示 ${stats.rulersShown} / ${stats.samples} 次采样`);
+  check('出现参考线', stats.guides > 0, `最多同时 ${stats.guides} 条`);
+  check('识别出重复组件', stats.dupTasks > 0, `复制任务 ${stats.dupTasks} 个`);
+  check('观察到 ⌥ 拖拽复制', stats.dupSeen > 0, `采样到 ${stats.dupSeen} 次`);
+  check('观察到钢笔画线', stats.penSeen > 0, `采样到 ${stats.penSeen} 次`);
+  check('出现间距红线', stats.redlines > 0, `最多同时 ${stats.redlines} 条`);
   const mid = await page.evaluate(() => {
     const s = window.__agentReveal && window.__agentReveal.state;
     return s ? { agents: s.agents.length, done: s.done } : null;
@@ -182,6 +224,9 @@ async function testRecording(code) {
     check('录屏：视频可完整解码（无花屏）', derr === 0, `ffmpeg 解码错误 ${derr}`);
     const dbad = dtsProblems(file);
     check('录屏：时间戳严格递增', dbad === 0, `非递增 ${dbad}`);
+    const ai = audioInfo(file);
+    check('录屏：带音效音轨且不是静音', !!ai && ai.maxDb > -45, ai ? `${ai.codec} 峰值 ${ai.maxDb} dB` : '没有音轨');
+  check('录屏：音视频时长一致', !!ai && ai.gap < 0.3, ai ? `相差 ${ai.gap.toFixed(2)}s` : '没有音轨');
     check('录屏：弹出保存位置面板', await page.locator('[data-agent-reveal-saved]').count() === 1);
     await page.screenshot({ path: path.join(outDir, 'saved-panel.png') });
     check('录屏流程无运行时错误', errors.length === 0, errors.join(' | '));

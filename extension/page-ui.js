@@ -5,6 +5,8 @@ export function injectConfig(cfg) {
   window.AGENT_REVEAL_CONFIG = {
     ...cfg,
     record: false, // 录屏由扩展负责
+    // 音效转发到离屏文档合成（网页里的 AudioContext 会被自动播放策略挂起）
+    sfx: cfg.sound ? (name, args) => { chrome.runtime.sendMessage({ target: 'offscreen', type: 'sfx', name, args }).catch(() => {}); } : null,
     onDone: () => chrome.runtime.sendMessage({ type: 'reveal-done' }),
     onAbort: () => chrome.runtime.sendMessage({ type: 'reveal-abort' }),
   };

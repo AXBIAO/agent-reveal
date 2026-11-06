@@ -5,7 +5,21 @@
  * 由 scripts/build.mjs 用 esbuild 打包成单文件 IIFE。
  */
 import { buildTypingScript } from './typing.js';
+import { durationScale } from './pace.js';
 import { canRecord, startRecording, stopRecording, discardRecording, showSavedPanel } from './recorder.js';
+import { SoundEngine, createSfx } from './sound.js';
+import { createRulers, RULER } from './rulers.js';
+import { computeGuides } from './guides.js';
+import { nearestGap } from './redline.js';
+import { createDesignLayer } from './design-layer.js';
+import { scanBeam, dissolveDelay, INTRO_MS } from './intro.js';
+import { createHud } from './hud.js';
+import { buildLayers, pageRect, restoreStyle, hide, wrapText, unwrapText } from './layers.js';
+import { findRepeatGroups, lineEnds } from './repeats.js';
+import {
+  BOX_PAD, createAgent, placeCursor, setTool, updateDragBox, updateSelectBox,
+  boxScreenRect, setBoxMode, showCursor, showCaret, hideCaret, setBadge,
+} from './agent-ui.js';
 
 (function () {
   'use strict';
@@ -15,11 +29,17 @@ import { canRecord, startRecording, stopRecording, discardRecording, showSavedPa
     startAgents: 3,         // 开场光标数
     rampRatio: 0.2,         // 前 20% 时长内从 startAgents 增长到 maxAgents
     durationMs: 30000,      // 用于计算 agent 增长节奏（实际总时长受页面长度影响）
-    speed: 0.7,             // 动作快慢系数，越小越快
+    speed: 1,               // 动作速度，越大越快（0.5–2）
     maxLayers: 700,         // 图层上限（超过时合并为更粗粒度）
     scrollAnchor: 0.38,     // 施工前沿保持在视口 38% 高度处
+    autoScroll: true,       // 自动向下滚动；关闭后只搭当前屏幕，用户滚到哪搭到哪
     showNames: false,       // 光标旁显示 agent 名字
+    rulers: true,           // 标尺、参考线、间距红线
+    duplicates: true,       // 重复组件用 ⌥ 拖拽复制（导航标签、卡片、列表行等）
+    sound: true,            // 鼠标、键盘、放置音效
+    intro: true,            // 开场溶解 + 扫描
     record: true,           // 自动录制当前标签页，完整跑完后下载并弹出保存位置
+    sfx: null,              // 宿主提供的音效通道 (name, args) => void（扩展转发到离屏文档）
     onDone: null,           // 钩子：跑完、还原页面前调用并等待（扩展用来停止录屏）
     onAbort: null,          // 钩子：Esc/✕ 中途退出时调用
     colors: ['#ff4d4f', '#2f7bff', '#16b364', '#f79009', '#9e77ed', '#ee46bc',
@@ -28,11 +48,8 @@ import { canRecord, startRecording, stopRecording, discardRecording, showSavedPa
   const CFG = Object.freeze({ ...DEFAULTS, ...(window.AGENT_REVEAL_CONFIG || {}) });
 
   const Z = 2147483647;
-  const BOX_PAD = 3;     // 选框比元素外扩的像素
-  const FRAME_MS = 28;   // 打字刷新间隔
-  const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'LINK', 'META', 'HEAD', 'BR', 'WBR']);
-  const MEDIA_TAGS = new Set(['IMG', 'SVG', 'VIDEO', 'CANVAS', 'PICTURE', 'IFRAME']);
-  const ATOMIC_TAGS = new Set(['BUTTON', 'INPUT', 'TEXTAREA', 'SELECT']);
+  const FRAME_MS = 28;      // 打字刷新间隔
+  const MAX_PLACED = 400;   // 计算间距红线时参考的已完成元素数
 
   if (window.__agentReveal) window.__agentReveal.stop();
 
@@ -50,221 +67,12 @@ import { canRecord, startRecording, stopRecording, discardRecording, showSavedPa
     if (html) n.innerHTML = html;
     return n;
   };
-
-  // ---------- 图层收集 ----------
   // 站点常开 scroll-behavior:smooth，逐帧 scrollTo 会互相打断，必须用 instant
   const scrollToY = (y) => window.scrollTo({ top: y, left: 0, behavior: 'instant' });
-
-  function isRendered(node, style) {
-    if (style.display === 'none' || style.visibility === 'hidden') return false;
-    const r = node.getBoundingClientRect();
-    return r.width >= 4 && r.height >= 4;
-  }
-
-  // opacity:0 的节点（常见于"滚动出现"区块）自身不当图层，但仍收集其子元素
-  const isTransparent = (style) => parseFloat(style.opacity) === 0;
-
-  function hasOwnText(node) {
-    for (const c of node.childNodes) {
-      if (c.nodeType === 3 && c.nodeValue.trim()) return true;
-    }
-    return false;
-  }
-
-  function isBlock(style, rect) {
-    if (rect.width < 24 || rect.height < 24) return false;
-    const bg = style.backgroundColor;
-    const hasBg = bg && bg !== 'transparent' && !/rgba\(.*,\s*0\)$/.test(bg);
-    const hasImg = style.backgroundImage && style.backgroundImage !== 'none';
-    const hasBorder = parseFloat(style.borderTopWidth) > 0 && style.borderTopStyle !== 'none';
-    const hasShadow = style.boxShadow && style.boxShadow !== 'none';
-    return hasBg || hasImg || hasBorder || hasShadow;
-  }
-
-  function classify(node, style, rect) {
-    if (MEDIA_TAGS.has(node.tagName.toUpperCase())) return 'media';
-    if (ATOMIC_TAGS.has(node.tagName)) return 'control';
-    if (hasOwnText(node)) return 'text';
-    if (isBlock(style, rect)) return 'block';
-    return null;
-  }
-
-  function collectLayers(root, overlay, opts) {
-    const layers = [];
-    // inFixed：祖先是 fixed/sticky 时，子元素同样随视口走，不参与滚动前沿计算
-    const walk = (node, depth, inFixed) => {
-      if (node === overlay || SKIP_TAGS.has(node.tagName)) return;
-      const style = getComputedStyle(node);
-      if (!isRendered(node, style)) return;
-      const rect = node.getBoundingClientRect();
-      const fixed = inFixed || style.position === 'fixed' || style.position === 'sticky';
-      const kind = node === document.body || isTransparent(style) ? null : classify(node, style, rect);
-      if (kind) {
-        layers.push({ node, kind, depth, fixed, top: rect.top + window.scrollY });
-        if (kind === 'media' || kind === 'control') return;
-        if (opts.coarse && kind === 'block' && depth >= opts.coarseDepth) return;
-      }
-      for (const c of node.children) walk(c, depth + 1, fixed);
-    };
-    walk(root, 0, false);
-    return layers;
-  }
-
-  function buildLayers(overlay) {
-    let layers = collectLayers(document.body, overlay, { coarse: false });
-    // 太多时逐级加粗粒度：深层 block 作为整体出现
-    for (let d = 12; layers.length > CFG.maxLayers && d >= 3; d -= 1) {
-      layers = collectLayers(document.body, overlay, { coarse: true, coarseDepth: d });
-    }
-    const ordered = layers
-      .map((l, i) => ({ ...l, index: i }))
-      .sort((a, b) => (Math.round(a.top / 48) - Math.round(b.top / 48)) || (a.index - b.index));
-    return ordered;
-  }
-
-  // ---------- 样式隐藏 / 还原 ----------
-  const PROPS = ['opacity', 'transition', 'filter'];
-  const probe = document.createElement('div');
-
-  function snapshotStyle(node) {
-    return {
-      attr: node.getAttribute('style'),
-      props: PROPS.map((p) => [p, node.style.getPropertyValue(p), node.style.getPropertyPriority(p)]),
-    };
-  }
-
-  // 只撤掉脚本动过的属性；若剩余样式与原始语义一致，再写回原始字符串做到字节级还原。
-  // 页面自己在动画期间改过的内联样式（如滑块 clip-path）会被保留。
-  function restoreStyle(node, snap) {
-    for (const [p, v, pri] of snap.props) {
-      if (v) node.style.setProperty(p, v, pri);
-      else node.style.removeProperty(p);
-    }
-    probe.setAttribute('style', snap.attr || '');
-    if (probe.style.cssText !== node.style.cssText) return;
-    if (snap.attr === null) node.removeAttribute('style');
-    else node.setAttribute('style', snap.attr);
-  }
-
-  function hide(layer) {
-    layer.snap = snapshotStyle(layer.node);
-    layer.node.style.setProperty('transition', 'none', 'important');
-    layer.node.style.setProperty('opacity', '0', 'important');
-  }
-
-  // ---------- 打字效果（字符数不变，布局不跳） ----------
-  function wrapText(node) {
-    const pieces = [];
-    for (const c of [...node.childNodes]) {
-      if (c.nodeType !== 3 || !c.nodeValue.trim()) continue;
-      const wrap = document.createElement('span');
-      const shown = document.createElement('span');
-      const rest = document.createElement('span');
-      rest.style.opacity = '0';
-      rest.textContent = c.nodeValue;
-      wrap.append(shown, rest);
-      c.replaceWith(wrap);
-      pieces.push({ original: c, wrap, shown, rest, text: c.nodeValue });
-    }
-    return pieces;
-  }
-
-  function unwrapText(pieces) {
-    for (const p of pieces) {
-      if (p.wrap.isConnected) p.wrap.replaceWith(p.original);
-    }
-  }
-
-  // ---------- 覆盖层 UI ----------
-  const CURSOR_SVG = (color) => `<svg width="22" height="22" viewBox="0 0 24 24" style="filter:drop-shadow(0 1px 2px rgba(0,0,0,.35))"><path d="M3 2l7.5 19 2.6-7.9L21 10.5z" fill="${color}" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/></svg>`;
-
-  function createOverlay() {
-    const overlay = el('div', `position:fixed;inset:0;z-index:${Z};pointer-events:none;font:12px/1.2 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;`);
-    overlay.setAttribute('data-agent-reveal', '');
-    const bar = el('div', 'position:fixed;right:18px;bottom:18px;display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:12px;background:rgba(24,24,27,.92);color:#e4e4e7;box-shadow:0 6px 24px rgba(0,0,0,.25);pointer-events:auto;backdrop-filter:blur(8px);');
-    bar.innerHTML = `
-      <span data-k="dot" style="width:9px;height:9px;border-radius:50%;background:#2f7bff;box-shadow:0 0 8px #2f7bff"></span>
-      <span><b data-k="agents" style="color:#fff">1</b> agents</span>
-      <span style="opacity:.35">|</span>
-      <span><b data-k="done" style="color:#fff">0</b> / <span data-k="total">0</span> layers</span>
-      <span style="width:72px;height:4px;border-radius:2px;background:rgba(255,255,255,.12);overflow:hidden"><span data-k="prog" style="display:block;height:100%;width:0;background:#2f7bff;transition:width .2s"></span></span>
-      <span data-k="typing" style="padding:2px 7px;border-radius:6px;background:rgba(47,123,255,.22);color:#9ec1ff;opacity:0;transition:opacity .2s">Typing…</span>
-      <span data-k="close" title="Esc 退出" style="cursor:pointer;opacity:.55;padding:0 2px">✕</span>`;
-    overlay.appendChild(bar);
-    const q = (k) => bar.querySelector(`[data-k="${k}"]`);
-    return { overlay, bar, refs: { agents: q('agents'), done: q('done'), total: q('total'), prog: q('prog'), typing: q('typing'), close: q('close') } };
-  }
-
-  function createAgent(overlay, id) {
-    const color = CFG.colors[id % CFG.colors.length];
-    const cursor = el('div', 'position:fixed;left:0;top:0;will-change:transform;transition:opacity .3s;opacity:0;');
-    cursor.innerHTML = CURSOR_SVG(color) + (CFG.showNames
-      ? `<span style="position:absolute;left:16px;top:18px;padding:1px 6px;border-radius:5px;background:${color};color:#fff;white-space:nowrap">Agent ${id + 1}</span>`
-      : '');
-    const box = el('div', `position:fixed;left:0;top:0;border:1.5px solid ${color};border-radius:2px;opacity:0;transition:opacity .18s,background-color .18s;box-sizing:border-box;`);
-    const handle = `position:absolute;width:6px;height:6px;background:#fff;border:1.5px solid ${color};box-sizing:border-box;transition:opacity .15s;`;
-    box.innerHTML = `
-      <i data-h style="${handle}left:-4px;top:-4px"></i><i data-h style="${handle}right:-4px;top:-4px"></i>
-      <i data-h style="${handle}left:-4px;bottom:-4px"></i><i data-h style="${handle}right:-4px;bottom:-4px"></i>
-      <span data-k="size" style="position:absolute;left:50%;top:100%;transform:translate(-50%,6px);padding:1px 5px;border-radius:3px;background:${color};color:#fff;font-size:10px;white-space:nowrap"></span>`;
-    overlay.append(box, cursor);
-    const edge = Math.floor(Math.random() * 4);
-    const x = edge === 1 ? innerWidth + 20 : edge === 3 ? -20 : rand(0, innerWidth);
-    const y = edge === 0 ? -20 : edge === 2 ? innerHeight + 20 : rand(0, innerHeight);
-    return {
-      id, color, cursor, box, x, y,
-      sizeLabel: box.querySelector('[data-k="size"]'),
-      handles: [...box.querySelectorAll('[data-h]')],
-      mode: 'idle',   // idle | drag | select
-      boxLayer: null,
-      anchor: null,   // 拖拽起点（元素上的相对角）
-    };
-  }
-
-  function placeCursor(agent) {
-    const s = agent.pressed ? 0.86 : 1;
-    agent.cursor.style.transform = `translate(${agent.x - 3}px, ${agent.y - 2}px) scale(${s})`;
-  }
-
-  function setBox(agent, left, top, width, height) {
-    const s = agent.box.style;
-    s.transform = `translate(${left}px, ${top}px)`;
-    s.width = `${width}px`;
-    s.height = `${height}px`;
-  }
-
-  // 拖拽中：框从起点角到当前光标；以元素实时位置为准，页面滚动时起点跟着走
-  function updateDragBox(agent) {
-    const r = agent.boxLayer.node.getBoundingClientRect();
-    const ax = r.left - BOX_PAD + (r.width + 2 * BOX_PAD) * agent.anchor.fx;
-    const ay = r.top - BOX_PAD + (r.height + 2 * BOX_PAD) * agent.anchor.fy;
-    const w = Math.abs(agent.x - ax);
-    const h = Math.abs(agent.y - ay);
-    setBox(agent, Math.min(ax, agent.x), Math.min(ay, agent.y), w, h);
-    agent.sizeLabel.textContent = `${Math.round(Math.max(w - 2 * BOX_PAD, 0))} × ${Math.round(Math.max(h - 2 * BOX_PAD, 0))}`;
-  }
-
-  function updateSelectBox(agent) {
-    const r = agent.boxLayer.node.getBoundingClientRect();
-    setBox(agent, r.left - BOX_PAD, r.top - BOX_PAD, r.width + 2 * BOX_PAD, r.height + 2 * BOX_PAD);
-  }
-
-  function setBoxMode(agent, mode) {
-    agent.mode = mode;
-    const dragging = mode === 'drag';
-    agent.box.style.backgroundColor = dragging ? `${agent.color}14` : 'transparent';
-    agent.handles.forEach((h) => { h.style.opacity = dragging ? '0' : '1'; });
-    agent.box.style.opacity = mode === 'idle' ? '0' : '1';
-  }
-
-  function showCursor(agent, on) {
-    agent.cursor.style.opacity = on ? '1' : '0';
-    agent.visible = on;
-  }
-
-  // ---------- 主流程 ----------
+  // ---------- 主流程状态 ----------
   const run = {
     stopped: false,
+    finished: false,
     timers: new Set(),
     raf: 0,
     layers: [],
@@ -272,14 +80,22 @@ import { canRecord, startRecording, stopRecording, discardRecording, showSavedPa
     agents: [],
     active: new Set(),
     queue: [],
+    guideTasks: [],
+    placed: [],
     typing: 0,
     typos: 0,
     done: 0,
     recording: null,
+    engine: null,
     scrollY: 0,
   };
+  let sfx = createSfx(() => {});
+  let design = null;
+  let rulers = null;
+  const xn = (agent) => clamp(agent.x / Math.max(1, innerWidth), 0, 1);
 
-  function moveTo(agent, getPoint, ms, bendMax = 0.18) {
+  /** onStep：每帧回调（拉参考线时让线跟着光标走） */
+  function moveTo(agent, getPoint, ms, bendMax = 0.18, onStep = null) {
     return new Promise((resolve) => {
       const sx = agent.x;
       const sy = agent.y;
@@ -298,6 +114,7 @@ import { canRecord, startRecording, stopRecording, discardRecording, showSavedPa
         agent.y = sy + dy * e + dx * arc;
         placeCursor(agent);
         if (agent.mode === 'drag') updateDragBox(agent);
+        if (onStep) onStep(agent);
         if (t < 1) requestAnimationFrame(step);
         else resolve();
       };
@@ -305,24 +122,42 @@ import { canRecord, startRecording, stopRecording, discardRecording, showSavedPa
     });
   }
 
-  // 当前打字位置：已显示文字最后一行的右端
+  // 当前打字位置：已显示文字最后一行的右端（含行高，用于插入光标）
   function caretPoint(pieces, fallback) {
     for (let i = pieces.length - 1; i >= 0; i -= 1) {
       const rects = pieces[i].shown.getClientRects();
       if (rects.length) {
         const r = rects[rects.length - 1];
-        return { x: r.right + 2, y: r.top + r.height * 0.55 };
+        return { x: r.right + 2, y: r.top + r.height * 0.55, top: r.top, h: r.height };
       }
     }
     const r = fallback.getBoundingClientRect();
-    return { x: r.left + 2, y: r.top + Math.min(r.height, 24) * 0.55 };
+    const h = Math.min(r.height, 24);
+    return { x: r.left + 2, y: r.top + h * 0.55, top: r.top, h };
   }
 
   const isHeading = (node) => /^H[1-3]$/.test(node.tagName)
     || parseFloat(getComputedStyle(node).fontSize) >= 24;
 
-  // 真人打字：逐字打出，标题会打错（重复字/颠倒/错字）再退格改对；光标跟着打字位置
-  async function typeLayer(agent, layer, speed) {
+  // 大标题逐级放大：先缩到相当于 GROW_FROM_PX 的大小，随进度分 GROW_STEPS 级放回原尺寸。
+  // 用 transform 不改真实字号，排版不跳；页面本身用了 transform 的标题不做
+  const GROW_MIN_PX = 28;
+  const GROW_FROM_PX = 18;
+  const GROW_STEPS = 4;
+  function setupGrow(node) {
+    const st = getComputedStyle(node);
+    const fs = parseFloat(st.fontSize);
+    if (!(fs >= GROW_MIN_PX) || st.transform !== 'none' || st.display === 'inline') return null;
+    const from = GROW_FROM_PX / fs;
+    const rtl = st.direction === 'rtl';
+    node.style.setProperty('transform-origin', rtl ? 'right top' : 'left top', 'important');
+    const apply = (step) => node.style.setProperty('transform', `scale(${from + ((1 - from) * step) / GROW_STEPS})`, 'important');
+    apply(0);
+    return { step: 0, apply };
+  }
+
+  // 真人打字：逐字打出，标题会打错再退格改对；I 形光标与插入光标跟着打字位置，带键盘声
+  async function typeLayer(agent, layer, pace) {
     const pieces = wrapText(layer.node);
     run.pieces.push(...pieces);
     const heading = isHeading(layer.node);
@@ -330,34 +165,74 @@ import { canRecord, startRecording, stopRecording, discardRecording, showSavedPa
       p.chars = Array.from(p.text);
       p.shown.textContent = '';
     }
+    const total = Math.max(1, pieces.reduce((n, p) => n + p.chars.length, 0));
+    let typedBefore = 0;
+    layer.node.style.setProperty('transition', 'none', 'important');
     layer.node.style.setProperty('opacity', '1', 'important');
+    const grow = heading ? setupGrow(layer.node) : null;
+    setTool(agent, 'text');
     run.typing += 1;
     for (const p of pieces) {
       const { frames, typos } = buildTypingScript(p.text, heading);
       run.typos += typos;
+      let prevLen = 0;
       for (const f of frames) {
         if (run.stopped) return;
         p.shown.textContent = f.shown;
         p.rest.textContent = p.chars.slice(f.restFrom).join('');
+        const len = f.shown.length;
+        if (len > prevLen) sfx.key(xn(agent), /\s$/.test(f.shown));
+        else if (len < prevLen) sfx.backspace(xn(agent));
+        prevLen = len;
+        if (grow) {
+          const step = Math.min(GROW_STEPS, Math.floor(((typedBefore + f.restFrom) / total) * GROW_STEPS));
+          if (step > grow.step) {
+            grow.step = step;
+            grow.apply(step);
+            sfx.grow(xn(agent), step);
+          }
+        }
         const c = caretPoint(pieces, layer.node);
-        agent.x += (c.x - agent.x) * 0.5;
+        showCaret(agent, c.x, c.top, c.h);
+        agent.x += (c.x + 6 - agent.x) * 0.5;
         agent.y += (c.y - agent.y) * 0.5;
         placeCursor(agent);
-        await sleep(Math.max(FRAME_MS, f.delay * speed), run);
+        await sleep(Math.max(FRAME_MS, f.delay * pace), run);
       }
+      typedBefore += p.chars.length;
     }
+    if (grow && grow.step < GROW_STEPS) grow.apply(GROW_STEPS);
+    hideCaret(agent);
     run.typing -= 1;
     unwrapText(pieces);
   }
-
-  // 块/图片在框内淡入，光标移到中间做一次"放下"
-  async function fadeLayer(agent, layer, ms) {
+  // 图片从上往下扫出来；页面自己用了 clip-path 的元素（如对比滑块）不碰，改用模糊淡入
+  function revealVisual(layer, ms) {
     const s = layer.node.style;
+    const sweep = layer.kind === 'media' && getComputedStyle(layer.node).clipPath === 'none';
+    if (sweep) {
+      s.setProperty('clip-path', 'inset(0 0 100% 0)', 'important');
+      s.setProperty('transition', 'none', 'important');
+      s.setProperty('opacity', '1', 'important');
+      void layer.node.offsetWidth;
+      s.setProperty('transition', `clip-path ${ms * 1.2}ms cubic-bezier(.3,.7,.2,1)`, 'important');
+      s.setProperty('clip-path', 'inset(0 0 0 0)', 'important');
+      return;
+    }
     s.setProperty('filter', 'blur(6px)', 'important');
     s.setProperty('transition', `opacity ${ms}ms ease, filter ${ms}ms ease`, 'important');
     void layer.node.offsetWidth;
     s.setProperty('opacity', '1', 'important');
     s.setProperty('filter', 'blur(0px)', 'important');
+  }
+
+  // 块/图片：线框占位 → 淡入真实内容，光标移到中间做一次"放下"
+  async function fadeLayer(agent, layer, ms) {
+    setBoxMode(agent, 'placeholder', layer.kind);
+    await sleep(ms * 0.45, run);
+    if (run.stopped) return;
+    setBoxMode(agent, 'select');
+    revealVisual(layer, ms);
     const drop = { fx: rand(0.4, 0.6), fy: rand(0.4, 0.6) };
     await moveTo(agent, () => {
       const r = layer.node.getBoundingClientRect();
@@ -370,9 +245,11 @@ import { canRecord, startRecording, stopRecording, discardRecording, showSavedPa
   async function press(agent, ms) {
     agent.pressed = true;
     placeCursor(agent);
+    sfx.press(xn(agent));
     await sleep(ms, run);
     agent.pressed = false;
     placeCursor(agent);
+    sfx.release(xn(agent));
   }
 
   // 元素上的相对角点（含外扩 BOX_PAD），实时计算
@@ -385,7 +262,38 @@ import { canRecord, startRecording, stopRecording, discardRecording, showSavedPa
 
   const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 
-  async function work(agent, layer, speed) {
+  // 放下后：量间距红线；所属参考线闪一下并发出吸附声
+  function afterRelease(agent, layer) {
+    if (!design || layer.fixed) return;
+    const rect = pageRect(layer.node);
+    design.redline(nearestGap(rect, run.placed));
+    for (const task of layer.guides || []) {
+      if (task.handle) {
+        task.handle.flash();
+        sfx.snap(xn(agent));
+      }
+    }
+  }
+
+  function finishLayer(layer) {
+    restoreStyle(layer.node, layer.snap);
+    layer.revealed = true;
+    run.active.delete(layer);
+    run.done += 1;
+    if (!layer.fixed && layer.box.w >= 8) {
+      run.placed = [...run.placed.slice(-MAX_PLACED + 1), pageRect(layer.node)];
+    }
+    for (const task of layer.guides || []) {
+      task.remaining -= 1;
+      if (task.remaining <= 0 && task.handle) {
+        const h = task.handle;
+        setTimeout(() => h.remove(), 600);
+      }
+    }
+  }
+
+  // pace：动作时长倍数（越小越快），由 durationScale(CFG.speed) 换算
+  async function work(agent, layer, pace) {
     run.active.add(layer);
     agent.boxLayer = layer;
     // 随机选一个角起拖，拖到对角，更像真人框选
@@ -396,87 +304,323 @@ import { canRecord, startRecording, stopRecording, discardRecording, showSavedPa
     const end = cornerOf(layer, 1 - fx, 1 - fy);
 
     showCursor(agent, true);
-    const approach = clamp(dist(agent, start()) * 0.9, 220, 800) * speed;
+    setTool(agent, 'arrow');
+    const approach = clamp(dist(agent, start()) * 0.9, 220, 800) * pace;
     await moveTo(agent, start, approach, 0.18);
     if (run.stopped) return;
 
-    // 按下 → 拖拽拉框
+    // 十字准星按下 → 拖拽拉框
+    setTool(agent, 'cross');
     agent.pressed = true;
     placeCursor(agent);
+    sfx.press(xn(agent));
     setBoxMode(agent, 'drag');
     updateDragBox(agent);
-    const dragMs = clamp(dist(start(), end()) * 1.1, 260, 950) * speed;
+    const dragMs = clamp(dist(start(), end()) * 1.1, 260, 950) * pace;
+    sfx.swish(xn(agent), dragMs / 1000);
     await moveTo(agent, end, dragMs, 0.04);
     if (run.stopped) return;
 
-    // 松手 → 框吸附到元素，显示控制点，内容出现
+    // 松手 → 框吸附到元素，显示控制点、间距红线，内容出现
     agent.pressed = false;
     placeCursor(agent);
+    sfx.release(xn(agent));
     setBoxMode(agent, 'select');
     const r = layer.node.getBoundingClientRect();
     agent.sizeLabel.textContent = `${Math.round(r.width)} × ${Math.round(r.height)}`;
-    await sleep(120 * speed, run);
+    afterRelease(agent, layer);
+    await sleep(120 * pace, run);
 
-    if (layer.kind === 'text') await typeLayer(agent, layer, speed);
-    else await fadeLayer(agent, layer, 520 * speed);
+    if (layer.kind === 'text') await typeLayer(agent, layer, pace);
+    else {
+      setTool(agent, 'arrow');
+      await fadeLayer(agent, layer, 520 * pace);
+    }
     if (run.stopped) return;
 
+    const area = (r.width * r.height) / Math.max(1, innerWidth * innerHeight);
+    sfx.place(layer.kind, xn(agent), area);
+    setTool(agent, 'arrow');
     setBoxMode(agent, 'idle');
     agent.boxLayer = null;
-    restoreStyle(layer.node, layer.snap);
-    layer.revealed = true;
-    run.active.delete(layer);
-    run.done += 1;
+    finishLayer(layer);
   }
 
+  // 标尺按需滑入：有光标在拉参考线时出现，最后一条拉完 0.6 秒后收回（常驻会挡住网站内容）
+  const RULER_HIDE_MS = 600;
+  let rulerUsers = 0;
+  let rulerTimer = 0;
+  function rulersIn() {
+    if (!rulers) return;
+    rulerUsers += 1;
+    clearTimeout(rulerTimer);
+    rulers.show(true);
+  }
+  function rulersOut() {
+    if (!rulers) return;
+    rulerUsers = Math.max(0, rulerUsers - 1);
+    if (rulerUsers) return;
+    rulerTimer = setTimeout(() => rulers.show(false), RULER_HIDE_MS);
+    run.timers.add(rulerTimer);
+  }
+
+  // ---------- 钢笔画线：起点锚点 → 橡皮筋跟着光标 → 终点锚点，线变实后真实分隔线出现 ----------
+  async function penLayer(agent, layer, pace) {
+    run.active.add(layer);
+    const ends = () => lineEnds(layer.node.getBoundingClientRect(), layer.line);
+    showCursor(agent, true);
+    setTool(agent, 'pen');
+    await moveTo(agent, () => ends().a, clamp(dist(agent, ends().a) * 0.9, 220, 800) * pace, 0.18);
+    if (run.stopped) return;
+    const pen = design ? design.pen(agent.color) : null;
+    if (pen) pen.anchorA(ends().a);
+    await press(agent, 70 * pace);
+    const len = dist(ends().a, ends().b);
+    const rubber = (a) => { if (pen) pen.rubber(ends().a, { x: a.x, y: a.y }); };
+    await moveTo(agent, () => ends().b, clamp(len * 1.1, 260, 950) * pace, 0.01, rubber);
+    if (run.stopped) return;
+    if (pen) pen.anchorB(ends().a, ends().b);
+    await press(agent, 70 * pace);
+    sfx.snap(xn(agent));
+    const s = layer.node.style;
+    s.setProperty('transition', `opacity ${200 * pace}ms ease`, 'important');
+    s.setProperty('opacity', '1', 'important');
+    await sleep(260 * pace, run);
+    if (pen) pen.remove();
+    setTool(agent, 'arrow');
+    finishLayer(layer);
+  }
+
+  // ---------- 复制组件：选中原件 → 按住 ⌥ 拖出副本 → 松手粘贴；副本里的文字之后再重新打 ----------
+  async function dupLayer(agent, task, pace) {
+    const { master, layer } = task;
+    run.active.add(layer);
+    const mRect = () => master.node.getBoundingClientRect();
+    const dRect = () => layer.node.getBoundingClientRect();
+    const grab = { fx: rand(0.3, 0.7), fy: rand(0.3, 0.7) };
+    const grabOn = (r) => ({ x: r.left + r.width * grab.fx, y: r.top + Math.min(r.height * grab.fy, 160) });
+    showCursor(agent, true);
+    setTool(agent, 'arrow');
+    await moveTo(agent, () => grabOn(mRect()), clamp(dist(agent, grabOn(mRect())) * 0.9, 220, 800) * pace, 0.18);
+    if (run.stopped) return;
+
+    // 选中原件
+    agent.boxLayer = master;
+    setBoxMode(agent, 'select');
+    const m0 = mRect();
+    agent.sizeLabel.textContent = `${Math.round(m0.width)} × ${Math.round(m0.height)}`;
+    sfx.press(xn(agent));
+    await sleep(160 * pace, run);
+    if (run.stopped) return;
+
+    // ⌥ 拖拽：副本框跟着光标走
+    setBadge(agent, '⌥');
+    agent.pressed = true;
+    placeCursor(agent);
+    setBoxMode(agent, 'idle');
+    const ghost = design ? design.ghost(agent.color) : null;
+    const follow = (a) => {
+      const r = mRect();
+      if (ghost) ghost.setRect(a.x - r.width * grab.fx, a.y - Math.min(r.height * grab.fy, 160), r.width, r.height);
+    };
+    follow(agent);
+    sfx.swish(xn(agent), 0.4);
+    const target = () => grabOn(dRect());
+    await moveTo(agent, target, clamp(dist(agent, target()) * 0.9, 300, 900) * pace, 0.06, follow);
+    if (run.stopped) return;
+
+    // 松手粘贴：副本里的色块、图片立即出现，文字保持隐藏（之后由光标重新打）
+    agent.pressed = false;
+    placeCursor(agent);
+    setBadge(agent, null);
+    sfx.release(xn(agent));
+    sfx.snap(xn(agent));
+    if (ghost) ghost.remove();
+    agent.boxLayer = layer;
+    setBoxMode(agent, 'select');
+    const r = dRect();
+    agent.sizeLabel.textContent = `${Math.round(r.width)} × ${Math.round(r.height)}`;
+    if (design) design.redline(nearestGap(pageRect(layer.node), run.placed));
+    for (const l of task.covers) {
+      run.active.add(l);
+      l.node.style.setProperty('transition', `opacity ${220 * pace}ms ease`, 'important');
+      l.node.style.setProperty('opacity', '1', 'important');
+    }
+    sfx.place(layer.kind, xn(agent), (r.width * r.height) / Math.max(1, innerWidth * innerHeight));
+    await sleep(320 * pace, run);
+    if (run.stopped) return;
+    setBoxMode(agent, 'idle');
+    agent.boxLayer = null;
+    for (const l of task.covers) finishLayer(l);
+  }
+
+  // ---------- 参考线任务：从标尺拉出一条线，停在对齐位置 ----------
+  async function pullGuide(agent, task, pace) {
+    const g = task.guide;
+    const memberRect = () => task.node.getBoundingClientRect();
+    const from = g.axis === 'x'
+      ? () => ({ x: RULER / 2, y: clamp(memberRect().top + 12, RULER + 12, innerHeight - 60) })
+      : () => ({ x: clamp(g.x - scrollX + 60, RULER + 12, innerWidth - 60), y: RULER / 2 });
+    const to = g.axis === 'x'
+      ? () => ({ x: g.pos - scrollX, y: from().y })
+      : () => ({ x: from().x, y: g.pos - scrollY });
+    showCursor(agent, true);
+    setTool(agent, 'arrow');
+    rulersIn();
+    try {
+      await dragGuide(agent, task, pace, from, to);
+    } finally {
+      rulersOut();
+    }
+  }
+
+  async function dragGuide(agent, task, pace, from, to) {
+    const g = task.guide;
+    await moveTo(agent, from, clamp(dist(agent, from()) * 0.9, 220, 800) * pace, 0.18);
+    if (run.stopped) return;
+    agent.pressed = true;
+    placeCursor(agent);
+    sfx.press(xn(agent));
+    sfx.guide(xn(agent));
+    const handle = design.addGuide(g.axis);
+    const follow = (a) => handle.setScreen(g.axis === 'x' ? a.x : a.y);
+    await moveTo(agent, to, clamp(dist(from(), to()) * 0.9, 300, 900) * pace, 0.02, follow);
+    if (run.stopped) return;
+    handle.setPage(g.pos);
+    agent.pressed = false;
+    placeCursor(agent);
+    sfx.release(xn(agent));
+    sfx.snap(xn(agent));
+    task.handle = handle;
+    if (task.remaining <= 0) setTimeout(() => handle.remove(), 600);
+    await sleep(160 * pace, run);
+  }
+
+  // 复制任务：重复组件里的复制品连同其中的色块/图片作为一个任务（⌥ 拖拽粘贴），其中的文字之后再重新打
+  function buildDupTasks(flowing) {
+    const parentIds = new Map();
+    const parentKey = (node) => {
+      const p = node.parentElement;
+      if (!parentIds.has(p)) parentIds.set(p, parentIds.size + 1);
+      return String(parentIds.get(p));
+    };
+    const className = (node) => (typeof node.className === 'string' ? node.className : (node.className && node.className.baseVal) || '');
+    const groups = findRepeatGroups(flowing.filter((l) => !l.line).map((l) => ({
+      id: l.order, parent: parentKey(l.node), tag: l.node.tagName, cls: className(l.node).trim(), w: l.box.w, h: l.box.h, order: l.order,
+    })));
+    const byOrder = new Map(flowing.map((l) => [l.order, l]));
+    const tasks = new Map();
+    const covered = new Set();
+    for (const g of groups) {
+      const master = byOrder.get(g.master);
+      for (const id of g.copies) {
+        const copy = byOrder.get(id);
+        if (!master || !copy || covered.has(copy) || copy.node.contains(master.node)) continue;
+        const covers = [copy, ...flowing.filter((l) => l !== copy && l.kind !== 'text' && !covered.has(l) && copy.node.contains(l.node))];
+        covers.forEach((l) => covered.add(l));
+        tasks.set(copy.order, { kind: 'dup', master, layer: copy, node: copy.node, fixed: false, top: copy.top, covers });
+      }
+    }
+    return { tasks, covered };
+  }
+
+  // 队列：复制任务替换复制品；参考线任务插到它对齐的第一个元素之前
+  function buildQueue(layers) {
+    const flowing = layers.filter((l) => !l.fixed);
+    const { tasks: dups, covered } = CFG.duplicates ? buildDupTasks(flowing) : { tasks: new Map(), covered: new Set() };
+    run.dupTasks = [...dups.values()];
+    const base = layers.flatMap((l) => {
+      if (dups.has(l.order)) return [dups.get(l.order)];
+      return covered.has(l) ? [] : [l];
+    });
+    if (!CFG.rulers) return base;
+    const plain = flowing.filter((l) => !covered.has(l));
+    const guides = computeGuides(plain.map((l) => ({ id: l.order, ...l.box })));
+    const byOrder = new Map(layers.map((l) => [l.order, l]));
+    const before = new Map();
+    for (const g of guides) {
+      const members = g.members.map((id) => byOrder.get(id)).filter(Boolean);
+      if (!members.length) continue;
+      const first = members.reduce((a, b) => (a.order < b.order ? a : b));
+      const task = { kind: 'guide', guide: g, node: first.node, fixed: false, top: first.top - 1, remaining: members.length, handle: null };
+      for (const m of members) m.guides = [...(m.guides || []), task];
+      before.set(first.order, [...(before.get(first.order) || []), task]);
+      run.guideTasks.push(task);
+    }
+    // 复制任务原样保留；普通图层前插入以它为首个成员的参考线任务（注意图层本身也有 kind 字段，不能用 kind 判断）
+    return base.flatMap((t) => (t.kind === 'dup' ? [t] : [...(before.get(t.order) || []), t]));
+  }
   function targetAgents(elapsed) {
     const ramp = CFG.durationMs * CFG.rampRatio;
     const k = clamp(elapsed / ramp, 0, 1);
     return Math.round(CFG.startAgents + (CFG.maxAgents - CFG.startAgents) * k * k);
   }
 
-  function tick(ui) {
-    if (run.stopped) return;
-    // 选框跟随滚动
+  function rulerBands() {
+    const bands = [];
     for (const a of run.agents) {
-      if (a.mode === 'drag') updateDragBox(a);
-      else if (a.mode === 'select') updateSelectBox(a);
+      if (!a.boxLayer || a.mode === 'idle') continue;
+      const r = boxScreenRect(a);
+      bands.push({ axis: 'x', from: r.left, to: r.right, color: a.color });
+      bands.push({ axis: 'y', from: r.top, to: r.bottom, color: a.color });
     }
-    // 自动滚动：施工前沿（在建图层与队首中最靠上的一个）保持在视口锚点
-    // 用实时位置：图片懒加载等会让页面高度在运行中变化
+    return bands;
+  }
+
+  function autoScroll() {
+    // 施工前沿（在建图层与队首中最靠上的一个）保持在视口锚点；用实时位置（懒加载会改变页面高度）
     const liveTop = (l) => l.node.getBoundingClientRect().top + window.scrollY;
     let frontier = Infinity;
     for (const l of run.active) if (!l.fixed) frontier = Math.min(frontier, liveTop(l));
     const head = run.queue.find((l) => !l.fixed);
     if (head) frontier = Math.min(frontier, liveTop(head));
-    if (frontier !== Infinity) {
-      const maxY = document.documentElement.scrollHeight - innerHeight;
-      const want = clamp(frontier - innerHeight * CFG.scrollAnchor, 0, maxY);
-      if (want > run.scrollY) {
-        run.scrollY += Math.max((want - run.scrollY) * 0.06, Math.min(1.5, want - run.scrollY));
-        scrollToY(run.scrollY);
-      }
+    if (frontier === Infinity) return;
+    const maxY = document.documentElement.scrollHeight - innerHeight;
+    const want = clamp(frontier - innerHeight * CFG.scrollAnchor, 0, maxY);
+    if (want > run.scrollY) {
+      run.scrollY += Math.max((want - run.scrollY) * 0.06, Math.min(1.5, want - run.scrollY));
+      scrollToY(run.scrollY);
     }
-    ui.refs.agents.textContent = String(Math.max(run.agents.filter((a) => a.busy).length, 1));
-    ui.refs.done.textContent = String(run.done);
-    ui.refs.prog.style.width = `${(run.done / run.layers.length) * 100}%`;
-    ui.refs.typing.style.opacity = run.typing > 0 ? '1' : '0';
-    run.raf = requestAnimationFrame(() => tick(ui));
   }
 
-  // 队首图层已进入视口（或是固定元素）才允许领取，保证光标都在镜头里
-  // 兜底：已滚到底或等待超时（如藏在屏幕外的面板永远进不了视口）也直接领取，避免死锁
+  function tick(hud) {
+    if (run.stopped) return;
+    for (const a of run.agents) {
+      if (a.mode === 'drag') updateDragBox(a);
+      else if (a.mode === 'select' || a.mode === 'placeholder') updateSelectBox(a);
+    }
+    if (CFG.autoScroll) autoScroll();
+    if (rulers) rulers.draw(rulerBands());
+    if (design) design.update();
+    const busy = run.agents.filter((a) => a.busy);
+    const waiting = !CFG.autoScroll && run.queue.length && !busy.length;
+    hud.update({
+      busyColors: busy.map((a) => a.color),
+      done: run.done,
+      total: run.layers.length,
+      typing: run.typing > 0,
+      hint: waiting ? '↓ 向下滚动继续' : '',
+    });
+    run.raf = requestAnimationFrame(() => tick(hud));
+  }
+
+  // 队首已进入视口（或是固定元素）才允许领取，保证光标都在镜头里。
+  // 自动滚动时的兜底：已滚到底或等待超时（如藏在屏幕外的面板）也直接领取，避免死锁
   const HEAD_WAIT_MS = 1500;
+  const DUP_WAIT_MS = 2500;
   function headInView(queue) {
     const l = queue[0];
     if (run.waitingFor !== l) {
       run.waitingFor = l;
       run.waitSince = performance.now();
     }
+    // 复制任务要等原件搭完（最多等 DUP_WAIT_MS，防止卡死）
+    if (l.kind === 'dup' && !l.master.revealed && performance.now() - run.waitSince < DUP_WAIT_MS) return false;
     if (l.fixed) return true;
     if (l.node.getBoundingClientRect().top < innerHeight * 0.92) return true;
     const atBottom = window.scrollY >= document.documentElement.scrollHeight - innerHeight - 2;
-    return atBottom || performance.now() - run.waitSince > HEAD_WAIT_MS;
+    if (atBottom) return true;
+    return CFG.autoScroll && performance.now() - run.waitSince > HEAD_WAIT_MS;
   }
 
   // 没有可领的图层时光标淡出，不在画面上闲逛；有活再淡入飞过去
@@ -488,15 +632,20 @@ import { canRecord, startRecording, stopRecording, discardRecording, showSavedPa
         await sleep(120, run);
         continue;
       }
-      const layer = queue.shift();
+      const task = queue.shift();
       agent.busy = true;
-      await work(agent, layer, CFG.speed * rand(0.8, 1.2));
+      const pace = durationScale(CFG.speed) * rand(0.8, 1.2);
+      if (task.kind === 'guide') await pullGuide(agent, task, pace);
+      else if (task.kind === 'dup') await dupLayer(agent, task, pace);
+      else if (task.line) await penLayer(agent, task, pace);
+      else await work(agent, task, pace);
     }
     agent.busy = false;
     showCursor(agent, false);
   }
 
-  function cleanup(ui) {
+  // keepEngine：录屏还在收尾时先不关音效引擎（关了音轨会提前结束）
+  function cleanup(ui, { keepEngine = false } = {}) {
     run.stopped = true;
     cancelAnimationFrame(run.raf);
     run.timers.forEach(clearTimeout);
@@ -507,6 +656,10 @@ import { canRecord, startRecording, stopRecording, discardRecording, showSavedPa
     if (run.recording) discardRecording(run.recording);
     if (!run.finished && typeof CFG.onAbort === 'function') CFG.onAbort();
     run.recording = null;
+    if (run.engine && !keepEngine) {
+      run.engine.close(run.finished ? 1.2 : 0.2);
+      run.engine = null;
+    }
     ui.overlay.remove();
     delete window.__agentReveal;
   }
@@ -538,9 +691,9 @@ import { canRecord, startRecording, stopRecording, discardRecording, showSavedPa
     });
   }
 
-  async function tryRecord() {
+  async function tryRecord(audioTrack) {
     try {
-      return await startRecording();
+      return await startRecording(audioTrack);
     } catch (err) {
       if (err && err.name === 'InvalidStateError') throw err;
       toast(err && err.name === 'NotAllowedError' ? '已取消共享，本次不录屏' : `录屏启动失败：${err && err.message}`);
@@ -548,18 +701,19 @@ import { canRecord, startRecording, stopRecording, discardRecording, showSavedPa
     }
   }
 
-  async function prepareRecording() {
+  async function prepareRecording(audioTrack) {
     if (!CFG.record) return null;
     if (!canRecord()) {
       toast('当前浏览器不支持标签页录屏，本次只播放');
       return null;
     }
     try {
-      return await tryRecord();
+      return await tryRecord(audioTrack);
     } catch {
       const choice = await askToStart();
+      if (run.engine) await run.engine.resume();
       if (choice !== 'record') return null;
-      try { return await tryRecord(); } catch { return null; }
+      try { return await tryRecord(audioTrack); } catch { return null; }
     }
   }
 
@@ -577,37 +731,81 @@ import { canRecord, startRecording, stopRecording, discardRecording, showSavedPa
     }
   }
 
+  // 书签版在本页合成声音（点书签的瞬间有用户激活，必须最先创建）；扩展版由宿主提供通道
+  function setupSound() {
+    if (!CFG.sound) return;
+    if (typeof CFG.sfx === 'function') {
+      sfx = createSfx(CFG.sfx);
+      return;
+    }
+    try {
+      run.engine = new SoundEngine().init();
+      sfx = createSfx(run.engine);
+    } catch (err) {
+      console.warn('[agent-reveal] 音效不可用', err);
+    }
+  }
+
+  // 开场：视口内元素自上而下溶解、扫描光带扫过；之后统一切回"立即隐藏"状态
+  async function intro(overlay) {
+    const vh = innerHeight;
+    for (const l of run.layers) {
+      const top = l.node.getBoundingClientRect().top;
+      hide(l, CFG.intro ? dissolveDelay(top, vh) ?? undefined : undefined);
+    }
+    if (!CFG.intro) return;
+    sfx.intro();
+    await scanBeam(overlay);
+    for (const l of run.layers) l.node.style.setProperty('transition', 'none', 'important');
+  }
+
   async function start() {
-    run.recording = await prepareRecording();
+    setupSound();
+    run.recording = await prepareRecording(run.engine && run.engine.createTrack());
     // Chrome 开始共享时顶部会出现提示条，等视口稳定后再收集图层
     if (run.recording) await new Promise((r) => setTimeout(r, 800));
-    const ui = createOverlay();
-    document.documentElement.appendChild(ui.overlay);
+    const overlay = el('div', `position:fixed;inset:0;z-index:${Z};pointer-events:none;font:12px/1.2 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;`);
+    overlay.setAttribute('data-agent-reveal', '');
+    document.documentElement.appendChild(overlay);
+    const ui = { overlay };
     scrollToY(0);
-    run.layers = buildLayers(ui.overlay);
+    run.layers = buildLayers(overlay, CFG.maxLayers);
     if (!run.layers.length) {
       cleanup(ui);
       alert('Agent Reveal：页面上没有找到可动画的元素。');
       return;
     }
-    run.layers.forEach(hide);
-    ui.refs.total.textContent = String(run.layers.length);
 
-    run.onKey = (e) => { if (e.key === 'Escape') cleanup(ui); };
+    if (CFG.rulers) {
+      design = createDesignLayer(overlay);
+      rulers = createRulers(overlay);
+    }
+    const hud = createHud(overlay, {
+      soundOn: true,
+      showSound: CFG.sound,
+      onClose: () => cleanup(ui),
+      onToggleSound: (on) => (run.engine ? run.engine.setOn(on) : sfx.setOn(on)),
+    });
+    hud.setTotal(run.layers.length);
+    run.onKey = (e) => {
+      if (e.key === 'Escape') cleanup(ui);
+      else if ((e.key === 'm' || e.key === 'M') && CFG.sound && !e.ctrlKey && !e.metaKey && !e.altKey) hud.toggleSound();
+    };
     window.addEventListener('keydown', run.onKey, true);
-    ui.refs.close.addEventListener('click', () => cleanup(ui));
     window.__agentReveal = { stop: () => cleanup(ui), state: run };
 
-    const queue = [...run.layers];
+    run.raf = requestAnimationFrame(() => tick(hud));
+    await intro(overlay);
+    if (run.stopped) return;
+
+    const queue = buildQueue(run.layers);
     run.queue = queue;
     const t0 = performance.now();
     const loops = [];
-    run.raf = requestAnimationFrame(() => tick(ui));
-
     while (!run.stopped && queue.length) {
       const want = targetAgents(performance.now() - t0);
       while (run.agents.length < want) {
-        const agent = createAgent(ui.overlay, run.agents.length);
+        const agent = createAgent(overlay, run.agents.length, CFG.colors[run.agents.length % CFG.colors.length], CFG.showNames);
         run.agents.push(agent);
         loops.push(agentLoop(agent, queue));
       }
@@ -615,18 +813,19 @@ import { canRecord, startRecording, stopRecording, discardRecording, showSavedPa
     }
     await Promise.all(loops);
     if (run.stopped) return;
-    ui.refs.done.textContent = String(run.layers.length);
-    ui.refs.prog.style.width = '100%';
-    ui.refs.typing.textContent = 'Done';
-    ui.refs.typing.style.opacity = '1';
+    hud.finish();
+    sfx.finale();
     await sleep(2200, run);
     if (run.stopped) return;
     // 先停录（保留 Done 画面），再还原页面，最后弹出保存位置
     run.finished = true;
     if (typeof CFG.onDone === 'function') await CFG.onDone();
+    const engine = run.engine;
     const recording = finishRecording();
-    cleanup(ui);
+    cleanup(ui, { keepEngine: true });
     await recording;
+    if (engine) engine.close(1.2);
+    run.engine = null;
   }
 
   start().catch((err) => {

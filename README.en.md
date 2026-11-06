@@ -25,9 +25,16 @@ The page itself is never modified: the script hides its elements, then 3 → 26 
 
 - **Swarm of cursors** — the crowd grows over time; each cursor flies to a corner, presses, drags a marquee to the opposite corner (live size label), releases, and the content appears inside the box
 - **Only working cursors are visible** — idle cursors fade out instead of floating around
-- **Human-like typing** — headings get typos (repeated, swapped or wrong characters), a pause, backspaces, then the correct text; the cursor follows the caret
-- **Design-tool look** — selection handles, `W × H` labels and a live `agents | layers | Typing…` status bar
+- **Human-like typing** — headings get typos (repeated, swapped or wrong characters), a pause, backspaces, then the correct text; a blinking caret; big headings start small and step up in size
+- **Design-tool look** — selection handles, `W × H` labels and red spacing measurements; rulers slide in only while a guide is being pulled, so they never cover the page
+- **Duplicates** — repeated components (nav chips, card grids, list rows) are detected; the first is built, the rest are <kbd>⌥</kbd>-dragged out as copies with spacing measurements, then their text is retyped
+- **Pen-tool lines** — dividers, single-side borders and `<hr>` are drawn with a pen: click an anchor, rubber-band to the end, click again
+- **Guides from the real layout** — left-aligned or top-aligned groups get a guide that a cursor drags out of the ruler; the aligned elements then snap to it
+- **Wireframe placeholders** — images and blocks appear as grey placeholders (images with a diagonal ✕) before the real content arrives; images sweep in top to bottom; cursors switch between arrow, crosshair and I-beam
+- **Synthesized sound** — mostly clicky: mouse presses, a mechanical keyboard and guide snaps, with only an occasional quiet mallet note for big blocks and images (on a beat grid, at most one or two per second); recorded into the video in sync (about ±30 ms)
+- **Intro & finale** — the page dissolves top-down into a blank canvas under a scan beam, and ends on a chord
 - **Clean MP4 recording** — WebCodecs H.264 + [mp4-muxer](https://github.com/Vanilagy/mp4-muxer); plays everywhere ([why not MediaRecorder?](#why-not-mediarecorder-for-mp4))
+- **Desktop / mobile view** — mobile view switches the page to a 390×844 phone layout and records a portrait video ([details](#mobile-view))
 - **Shows where the file is** — the extension displays the real saved path, with *Show in folder* / *Open*
 - **Exact restore** — original `style` attributes are written back byte for byte
 - **Two ways to use it** — Chrome extension (recommended) or a zero-install bookmarklet
@@ -75,14 +82,28 @@ Shortcut: <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd> starts with your last set
 
 | Setting | Default | Description |
 | --- | --- | --- |
-| Auto record | on | Records the current tab and saves an MP4 at the end |
+| View | Desktop | **Desktop**: play and record at the current window size; **Mobile**: 390×844 phone layout, portrait video |
+| Auto record | on | Records the current tab (with sound) and saves an MP4 at the end |
+| Sound | on | Mouse, keyboard and placement sounds; mute from the status bar or press <kbd>M</kbd> |
+| Rulers & guides | on | Guides (rulers slide in while pulling) and spacing redlines |
+| Auto scroll | on | When off, only the current screen is built; scroll down yourself and the swarm follows |
 | Max cursors | 26 | Maximum number of cursors at the same time (4–40) |
-| Speed | 0.70× | Lower is faster; lower it for long pages |
+| Speed | 1.0× | **Higher is faster** (0.5×–2.0×); raise it for long pages |
 | Show agent names | off | Shows `Agent 1`, `Agent 2`… next to each cursor |
 
-Recordings are saved to `<Downloads>/agent-reveal/agent-reveal-<host>-<date>-<time>.mp4`.
+Recordings are saved to `<Downloads>/agent-reveal/agent-reveal-<host>-<date>-<time>.mp4`. Only the page content is recorded (no address bar or tabs), at the page's real pixel size.
 
-**Tips:** press <kbd>F11</kbd> for fullscreen before starting, close DevTools and cookie banners, and use a high display scale for sharper output.
+**Tips:** close DevTools and cookie banners before starting.
+
+## Mobile view
+
+Choose **📱 Mobile** in the popup. The extension then:
+
+1. Temporarily shrinks the current window to phone proportions and raises this tab's zoom so the page viewport is exactly **390×844** — responsive sites switch to their mobile layout
+2. Picks the largest zoom that fits your screen for a sharper portrait video (e.g. about 620×1342 on a 2560×1440 screen)
+3. Restores the window size, position, maximized state and zoom when it finishes or you press <kbd>Esc</kbd>
+
+Notes: it switches layouts by viewport width, so sites that redirect to a separate mobile site based on the user agent (e.g. `m.example.com`) won't switch. Zoom applies to this tab only. On short screens the window extends below the screen edge to keep the phone height; that part is still recorded. The bookmarklet doesn't support mobile view — use DevTools device mode (<kbd>F12</kbd> → <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd>) instead.
 
 ## Bookmarklet options
 
@@ -91,7 +112,9 @@ Set `window.AGENT_REVEAL_CONFIG` in the console before clicking the bookmark:
 ```js
 window.AGENT_REVEAL_CONFIG = {
   maxAgents: 26, startAgents: 3, rampRatio: 0.2, durationMs: 30000,
-  speed: 0.7, showNames: false, record: true,
+  speed: 1, // higher is faster (0.5–2)
+  showNames: false, record: true,
+  rulers: true, duplicates: true, sound: true, autoScroll: true, intro: true,
 };
 ```
 
@@ -119,12 +142,17 @@ In our tests Chrome's `MediaRecorder` MP4 output has broken H.264 slices: ffmpeg
 ```bash
 npm run build      # bookmarklet (dist/) + extension scripts (extension/)
 npm run test:unit  # unit tests
+npm run test:sync  # A/V sync: flash + click recorded together, must stay within ±60 ms
 npm run test:e2e   # bookmarklet E2E (playback, restore, Esc, decodable recording)
 npm run test:ext   # extension E2E (tabCapture recording, real-path panel, Esc)
 npm test           # everything
 ```
 
 E2E runs against `https://eye.zsf.si` by default; use `--url` to change it. The extension E2E uses Playwright's Chromium (`npx playwright install chromium`) because branded Chrome 137+ no longer loads unpacked extensions from the command line. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Credits
+
+Design ideas come from Joel Califa's [Swarm](https://califa.github.io/swarm-site/) site and Dhvanil Patel's [Swarm Rebuild](https://github.com/DhvanilPatel/swarm-cursors) extension: crosshair-drawn boxes, ruler guides, wireframe placeholders and mostly-clicky sound. Neither is published under a license, so **no code from them is used here**, and the approach differs: they snapshot the page into a blueprint and redraw it on a canvas, while Agent Reveal reveals the real DOM elements in place, and adds auto scroll, mobile view and MP4 recording with sound.
 
 ## License
 
